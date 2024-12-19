@@ -92,7 +92,20 @@ export default defineNuxtConfig({
       chatMaxAttachedMessages: 50,
       appName: APP_NAME,
     },
-    modelProxyUrl: ''
+    modelProxyUrl: '',
+    mcpServers: {
+            "tavily": {
+                "command": "C:\\Users\\DaWil\\AppData\\Local\\Microsoft\\WindowsApps\\python.exe",
+                "args": ["-m", "mcp_server_tavily"],
+                "env": {
+                    "TAVILY_API_KEY": "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"
+                }
+            },
+            "fetch": {
+                "command": "uvx",
+                "args": ["mcp-server-fetch"]
+            }
+        }
   },
   i18n: {
     //Asynchronous call, on-demand loading
