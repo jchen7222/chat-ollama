@@ -17,7 +17,10 @@ import { McpService } from '@/server/utils/mcp'
 import { zodToJsonSchema } from 'zod-to-json-schema'
 import { ChatOllama } from '@langchain/ollama'
 import { tool } from '@langchain/core/tools'
-import { BaseChatModel } from '@langchain/core/language_models/chat_models'
+import { BaseChatModel, BaseChatModelCallOptions } from '@langchain/core/language_models/chat_models'
+import { z } from "zod"
+import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 
 interface RequestBody {
   knowledgebaseId: number
@@ -30,6 +33,20 @@ interface RequestBody {
     toolResult: boolean
   }[]
   stream: any
+}
+
+interface ToolCall {
+  name: string
+  // Add other properties as needed
+}
+
+interface GatheredResponse {
+  tool_calls?: ToolCall[]
+  // Add other properties that might be in the gathered response
+}
+
+interface ChatModelCallOptions extends BaseChatModelCallOptions {
+  tools?: any[]
 }
 
 const SYSTEM_TEMPLATE = `Answer the user's question based on the context below.
@@ -90,7 +107,7 @@ export default defineEventHandler(async (event) => {
     }
 
     const embeddings = createEmbeddings(knowledgebase.embedding!, event)
-    const retriever: BaseRetriever = await createRetriever(embeddings, `collection_${knowledgebase.id}`)
+    const retriever: BaseRetriever = await createRetriever(embeddings, `collection_${knowledgebase.id}`) as BaseRetriever
 
     const chat = createChatModel(model, family, event)
     const query = messages[messages.length - 1].content
@@ -178,37 +195,84 @@ export default defineEventHandler(async (event) => {
     })())
     return sendStream(event, readableStream)
   } else {
-    let llm = createChatModel(model, family, event)
+    const calculatorSchema = z.object({
+      operation: z
+        .enum(["add", "subtract", "multiply", "divide"])
+        .describe("The type of operation to execute."),
+      number1: z.number().describe("The first number to operate on."),
+      number2: z.number().describe("The second number to operate on."),
+    })
+
+    const calculatorTool = tool(
+      async ({ operation, number1, number2 }) => {
+        // Functions must return strings
+        if (operation === "add") {
+          return `${number1 + number2}`
+        } else if (operation === "subtract") {
+          return `${number1 - number2}`
+        } else if (operation === "multiply") {
+          return `${number1 * number2}`
+        } else if (operation === "divide") {
+          return `${number1 / number2}`
+        } else {
+          throw new Error("Invalid operation.")
+        }
+      },
+      {
+        name: "calculator",
+        description: "Can perform mathematical operations.",
+        schema: calculatorSchema,
+      }
+    )
+    const transport = new StdioClientTransport({
+      command: "C:\\Users\\DaWil\\AppData\\Local\\Microsoft\\WinGet\\Packages\\astral-sh.uv_Microsoft.Winget.Source_8wekyb3d8bbwe\\uvx.exe",
+      args: ["mcp-server-sqlite", "--db-path", "C:\\Users\\DaWil\\test.db"],
+    })
+    const client = new Client({
+      name: "chatollama-client",
+      version: "1.0.0",
+    }, {
+      capabilities: {}
+    })
+    await client.connect(transport)
+    const toolsResponse = await client.listTools()
+    const mcpTools = toolsResponse.tools.map((t) => {
+      const _Tool = tool(
+        async (args) => {
+          // Functions must return strings
+          const result = await client.callTool({
+            name: t.name,
+            arguments: args
+          })
+          console.log(result)
+          return result
+        },
+        {
+          name: t.name,
+          description: t.description,
+          schema: t.inputSchema,
+        }
+      )
+      return _Tool
+    })
+    let llm = createChatModel(model, family, event) as BaseChatModel
+    if (mcpTools.length > 0) {
+      llm = llm.bind({ tools: mcpTools } as ChatModelCallOptions) as BaseChatModel
+    }
 
     const mcpService = new McpService()
-    const normalizedTools = await mcpService.listTools()
-    const toolsMap = normalizedTools.reduce((acc, tool) => {
-      acc[tool.name] = tool
-      return acc
-    }, {})
+    const normalizedTools: any[] = (await mcpService.listTools()) ?? []
+    let toolsMap: Record<string, any> = {}
+    if (normalizedTools && normalizedTools.length > 0) {
+      toolsMap = normalizedTools.reduce((acc, tool) => {
+        acc[tool.name] = tool
+        return acc
+      }, {} as Record<string, any>)
+    }
     if (family === MODEL_FAMILIES.anthropic && normalizedTools?.length) {
-      /*
-      if (family === MODEL_FAMILIES.gemini) {
-        llm = llm.bindTools(normalizedTools.map((t) => {
-          console.log(`Tool ${t.name}: `, t.mcpSchema)
-          return {
-            name: t.name,
-            description: t.description,
-            parameters: t.mcpSchema
-          }
-        }))
-      } else {
-        llm = llm.bindTools(normalizedTools)
-      }
-      */
-      if (llm?.bindTools) {
-        llm = llm.bindTools(normalizedTools) as BaseChatModel
-      }
-    } else if (llm instanceof ChatOllama) {
-      /*
-      console.log("Binding tools to ChatOllama")
-      llm = llm.bindTools(normalizedTools)
-      */
+      llm = llm.bind({ tools: normalizedTools } as ChatModelCallOptions) as BaseChatModel
+    } else if (llm instanceof ChatOllama && normalizedTools?.length) {
+      llm = llm.bind({ tools: normalizedTools } as ChatModelCallOptions) as BaseChatModel
     }
 
     if (!stream) {
@@ -229,55 +293,57 @@ export default defineEventHandler(async (event) => {
 
     console.log(response)
 
-    const readableStream = Readable.from((async function* () {
+    let gathered: GatheredResponse | undefined = undefined
 
-      let gathered = undefined
+    const readableStream = new ReadableStream({
+      async start(controller) {
+        for await (const chunk of response) {
+          gathered = gathered !== undefined ? concat(gathered, chunk) : chunk
 
-      for await (const chunk of response) {
-        gathered = gathered !== undefined ? concat(gathered, chunk) : chunk
+          let content = chunk?.content
 
-        let content = chunk?.content
-
-        // Handle array of text_delta objects
-        if (Array.isArray(content)) {
-          content = content
-            .filter(item => item.type === 'text_delta')
-            .map(item => item.text)
-            .join('')
-        }
-
-        const message = {
-          message: {
-            role: 'assistant',
-            content: content
+          // Handle array of text_delta objects
+          if (Array.isArray(content)) {
+            content = content
+              .filter(item => item.type === 'text_delta' && 'text' in item)
+              .map(item => (item as { text: string }).text)
+              .join('')
           }
-        }
-        yield `${JSON.stringify(message)} \n\n`
-      }
-
-      for (const toolCall of gathered?.tool_calls ?? []) {
-        console.log("Tool call: ", toolCall)
-        const selectedTool = toolsMap[toolCall.name]
-
-        if (selectedTool) {
-          const result = await selectedTool.invoke(toolCall)
-
-          console.log("Tool result: ", result)
 
           const message = {
             message: {
-              role: "user",
-              type: "tool_result",
-              tool_use_id: result.tool_call_id,
-              content: result.content
+              role: 'assistant',
+              content: chunk?.content
             }
           }
+          controller.enqueue(`${JSON.stringify(message)} \n\n`)
+        }
 
-          yield `${JSON.stringify(message)} \n\n`
+        // Process tool calls after the main response
+        if (gathered?.tool_calls?.length) {
+          for (const toolCall of gathered.tool_calls) {
+            console.log("Tool call: ", toolCall)
+            const selectedTool = toolsMap[toolCall.name]
+
+            if (selectedTool) {
+              const result = await selectedTool.invoke(toolCall)
+              console.log("Tool result: ", result)
+
+              const message = {
+                message: {
+                  role: "user",
+                  type: "tool_result",
+                  tool_use_id: result.tool_call_id,
+                  content: result.content
+                }
+              }
+
+              controller.enqueue(`${JSON.stringify(message)} \n\n`)
+            }
+          }
         }
       }
-
-    })())
+    })
 
     return sendStream(event, readableStream)
   }
